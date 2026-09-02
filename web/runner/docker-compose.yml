@@ -1,0 +1,24 @@
+# Self-hosted Piston code runner for Codev.
+#   docker compose up -d
+#   node install-languages.mjs            # installs python, node, gcc, java, ... (one-time, ~10 min)
+# Then set in web/.env.local:  PISTON_URL=http://localhost:2000/api/v2
+services:
+  piston:
+    image: ghcr.io/engineer-man/piston:latest
+    container_name: codev-piston
+    restart: unless-stopped
+    privileged: true          # required by Piston's isolate sandbox
+    ports:
+      - "2000:2000"
+    volumes:
+      - piston_packages:/piston/packages
+    environment:
+      PISTON_RUN_TIMEOUT: "10000"
+      PISTON_COMPILE_TIMEOUT: "20000"
+      PISTON_OUTPUT_MAX_SIZE: "65536"
+      PISTON_MAX_CONCURRENT_JOBS: "8"
+    tmpfs:
+      - /tmp:exec
+
+volumes:
+  piston_packages:
