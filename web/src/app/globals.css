@@ -1,0 +1,7 @@
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/jetbrains-mono';
+@import '../frontend/styles/tokens.css';
+@import '../frontend/styles/base.css';
+@import '../frontend/styles/ui.css';
+@import '../frontend/styles/ide.css';
+@import '../frontend/styles/pages.css';
