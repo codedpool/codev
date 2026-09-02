@@ -1,0 +1,497 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Codev API",
+    "version": "1.0.0",
+    "description": "REST API for the Codev browser IDE: projects, files, code execution, AI (Groq, falling back to Gemini), and local git-style commit history. All routes except /api/health require a signed-in Clerk session (the `__session` cookie set by the app) — there is no separate bearer-token auth for third-party clients."
+  },
+  "servers": [
+    { "url": "/api", "description": "Same origin as the deployed app" }
+  ],
+  "tags": [
+    { "name": "System", "description": "Health and capability discovery" },
+    { "name": "Projects", "description": "Create, list, read, and delete projects" },
+    { "name": "Files", "description": "Read, save, delete, and rename files within a project" },
+    { "name": "Run", "description": "Execute a saved file" },
+    { "name": "AI", "description": "Chat, inline completion, lint, docs, and snippet generation (Groq, with automatic Gemini fallback)" },
+    { "name": "Git", "description": "Local commit history per project — commit, log, diff, revert. No remotes." }
+  ],
+  "components": {
+    "securitySchemes": {
+      "clerkSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__session",
+        "description": "Clerk session cookie. Set automatically by the app after sign-in; there is no API-key auth for external clients."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "string", "example": "Sign in required" } },
+        "required": ["error"]
+      },
+      "FileRef": {
+        "type": "object",
+        "properties": { "fileName": { "type": "string", "example": "src/main.py" } },
+        "required": ["fileName"]
+      },
+      "ProjectSummary": {
+        "type": "object",
+        "properties": {
+          "projectId": { "type": "string", "format": "uuid" },
+          "projectName": { "type": "string" },
+          "files": { "type": "array", "items": { "$ref": "#/components/schemas/FileRef" } },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ProjectDetail": {
+        "type": "object",
+        "properties": {
+          "projectId": { "type": "string", "format": "uuid" },
+          "projectName": { "type": "string" },
+          "files": { "type": "array", "items": { "$ref": "#/components/schemas/FileRef" } },
+          "owner": { "type": "boolean", "description": "Whether the signed-in user owns this project (vs. opened via share link)" },
+          "git": {
+            "type": "object",
+            "properties": {
+              "branch": { "type": "string", "example": "main" },
+              "headOid": { "type": "string", "nullable": true, "description": "40-char SHA-1 of the latest commit, or null with no commits yet" }
+            }
+          }
+        }
+      },
+      "Capabilities": {
+        "type": "object",
+        "properties": {
+          "runner": { "type": "string", "enum": ["judge0", "piston", "jdoodle", "local", "none"] },
+          "languages": { "type": "array", "items": { "type": "string" }, "description": "File extensions the active runner can execute" },
+          "ai": { "type": "boolean" },
+          "models": {
+            "type": "object",
+            "properties": {
+              "chat": { "type": "string", "example": "openai/gpt-oss-120b" },
+              "fast": { "type": "string", "example": "openai/gpt-oss-20b" },
+              "fallback": { "type": "string", "nullable": true, "description": "Gemini model used if the primary Groq call fails, or null if no fallback is configured" }
+            }
+          },
+          "collab": { "type": "boolean", "description": "Whether real-time collaboration (NEXT_PUBLIC_COLLAB_URL) is configured" }
+        }
+      },
+      "RunResult": {
+        "type": "object",
+        "properties": {
+          "output": { "type": "string" },
+          "exitCode": { "type": "integer" },
+          "runner": { "type": "string", "example": "judge0" },
+          "time": { "type": "string", "description": "Execution time in seconds, when reported by the runner" },
+          "memory": { "type": "integer", "description": "Peak memory in KB, when reported by the runner" },
+          "version": { "type": "string", "description": "Resolved language/runtime version, when known" }
+        }
+      },
+      "Commit": {
+        "type": "object",
+        "properties": {
+          "oid": { "type": "string", "description": "40-char SHA-1 commit hash" },
+          "message": { "type": "string" },
+          "author": { "type": "string" },
+          "email": { "type": "string" },
+          "date": { "type": "string", "format": "date-time" },
+          "parent": { "type": "string", "nullable": true }
+        }
+      },
+      "CommitDiff": {
+        "type": "object",
+        "properties": {
+          "oid": { "type": "string" },
+          "parentOid": { "type": "string", "nullable": true },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "status": { "type": "string", "enum": ["added", "modified", "deleted"] },
+                "before": { "type": "string" },
+                "after": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "ProjectIdQuery": {
+        "name": "projectId",
+        "in": "query",
+        "required": true,
+        "schema": { "type": "string", "format": "uuid" }
+      }
+    },
+    "responses": {
+      "Unauthorized": { "description": "No signed-in session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "NotFound": { "description": "Resource not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "BadRequest": { "description": "Invalid request body or parameters", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "RateLimited": { "description": "Too many requests", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  },
+  "security": [{ "clerkSession": [] }],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Liveness check",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is up",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" }, "service": { "type": "string" }, "time": { "type": "string", "format": "date-time" } } } } }
+          }
+        }
+      }
+    },
+    "/capabilities": {
+      "get": {
+        "tags": ["System"],
+        "summary": "What this deployment supports",
+        "description": "Reports the active code runner and its languages, whether AI is configured (and which models), and whether real-time collaboration is enabled. Used by the client to adapt the UI.",
+        "responses": {
+          "200": { "description": "Capabilities", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Capabilities" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/projects": {
+      "get": {
+        "tags": ["Projects"],
+        "summary": "List your projects",
+        "responses": {
+          "200": { "description": "Projects owned by the signed-in user, newest first", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ProjectSummary" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["Projects"],
+        "summary": "Create a project",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["projectName"], "properties": { "projectName": { "type": "string", "maxLength": 80 } } } } }
+        },
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectSummary" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/projects/{projectId}": {
+      "get": {
+        "tags": ["Projects"],
+        "summary": "Get a project",
+        "description": "Any signed-in user with the link can open a project (share-by-link) — not just the owner.",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Project detail", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectDetail" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Projects"],
+        "summary": "Delete a project",
+        "description": "Owner only. Also deletes all of the project's files from S3 and its git history from storage.",
+        "parameters": [{ "name": "projectId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+        "responses": {
+          "200": { "description": "Deleted", "content": { "application/json": { "schema": { "type": "object", "properties": { "message": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "Not the project owner", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/files": {
+      "post": {
+        "tags": ["Files"],
+        "summary": "Save a file (create or overwrite)",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["projectId", "fileName"],
+            "properties": {
+              "projectId": { "type": "string", "format": "uuid" },
+              "fileName": { "type": "string", "description": "Project-relative path, no leading slash or .. segments" },
+              "content": { "type": "string", "description": "Max 2 MB UTF-8" }
+            }
+          } } }
+        },
+        "responses": {
+          "201": { "description": "Saved", "content": { "application/json": { "schema": { "type": "object", "properties": { "message": { "type": "string" }, "fileName": { "type": "string" } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": { "description": "File exceeds the 2 MB limit", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/files/{projectId}/{path}": {
+      "get": {
+        "tags": ["Files"],
+        "summary": "Read a file's content",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "path", "in": "path", "required": true, "schema": { "type": "string" }, "description": "File path, may contain slashes (catch-all segment)" }
+        ],
+        "responses": {
+          "200": { "description": "File content", "content": { "application/json": { "schema": { "type": "object", "properties": { "content": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Files"],
+        "summary": "Delete a file",
+        "parameters": [
+          { "name": "projectId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+          { "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Deleted", "content": { "application/json": { "schema": { "type": "object", "properties": { "message": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/files/rename": {
+      "post": {
+        "tags": ["Files"],
+        "summary": "Rename or move a file or folder",
+        "description": "When both `from` and `to` end with `/`, every file under that folder is moved.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["projectId", "from", "to"],
+            "properties": {
+              "projectId": { "type": "string", "format": "uuid" },
+              "from": { "type": "string" },
+              "to": { "type": "string" }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Moved", "content": { "application/json": { "schema": { "type": "object", "properties": { "moved": { "type": "array", "items": { "type": "object", "properties": { "from": { "type": "string" }, "to": { "type": "string" } } } } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "Destination already exists", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/run": {
+      "post": {
+        "tags": ["Run"],
+        "summary": "Execute a saved file",
+        "description": "Reads the file's currently saved content from storage and runs it through the active code runner (Judge0, Piston, JDoodle, or the local toolchain in development). Save the file before calling this.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["projectId", "fileName"],
+            "properties": {
+              "projectId": { "type": "string", "format": "uuid" },
+              "fileName": { "type": "string" },
+              "input": { "type": "string", "description": "Text piped to the program's stdin" }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Execution result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunResult" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "description": "File not found — save it before running", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "description": "No code runner is configured on this server", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/ai/chat": {
+      "post": {
+        "tags": ["AI"],
+        "summary": "Streaming chat completion",
+        "description": "Streams the assistant's reply as plain text chunks (`Content-Type: text/plain`), not SSE or JSON — read the response body incrementally. Runs on Groq, automatically retried on Gemini if Groq fails.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["messages"],
+            "properties": {
+              "messages": {
+                "type": "array",
+                "items": { "type": "object", "properties": { "role": { "type": "string", "enum": ["user", "assistant"] }, "content": { "type": "string" } } },
+                "description": "Last 12 are used; each message is truncated to 20,000 characters"
+              },
+              "context": {
+                "type": "object",
+                "description": "Optional context about the file/selection the user is asking about",
+                "properties": {
+                  "mode": { "type": "string", "enum": ["code-only"], "description": "code-only asks the model to return just a fenced code block" },
+                  "fileName": { "type": "string" },
+                  "language": { "type": "string" },
+                  "code": { "type": "string" },
+                  "isSelection": { "type": "boolean" },
+                  "selectionLines": { "type": "object", "properties": { "from": { "type": "integer" }, "to": { "type": "integer" } } },
+                  "problems": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Streamed plain-text reply", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/ai/auto-complete": {
+      "post": {
+        "tags": ["AI"],
+        "summary": "Inline (ghost-text) completion",
+        "description": "FIM-style completion for the code immediately around the cursor. Runs on Groq's fast model, with Gemini fallback. Returns an empty suggestion (200) instead of an error when rate-limited, so the editor stays silent rather than surfacing a failure.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "properties": {
+              "prefix": { "type": "string", "description": "Code before the cursor (last ~2500 chars used); `code` is accepted as an alias" },
+              "suffix": { "type": "string", "description": "Code after the cursor (first ~600 chars used)" },
+              "language": { "type": "string" },
+              "fileName": { "type": "string" }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Suggestion (possibly empty)", "content": { "application/json": { "schema": { "type": "object", "properties": { "suggestions": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/ai/lint": {
+      "post": {
+        "tags": ["AI"],
+        "summary": "Suggest fixes for syntax errors and bugs",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "code": { "type": "string" } } } } } },
+        "responses": {
+          "200": { "description": "Suggested fixes", "content": { "application/json": { "schema": { "type": "object", "properties": { "fixes": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/ai/generate-docs": {
+      "post": {
+        "tags": ["AI"],
+        "summary": "Generate documentation for code",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "code": { "type": "string" } } } } } },
+        "responses": {
+          "200": { "description": "Generated docs", "content": { "application/json": { "schema": { "type": "object", "properties": { "docs": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/ai/generate-snippet": {
+      "post": {
+        "tags": ["AI"],
+        "summary": "Generate a code snippet from a description",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "description": { "type": "string" } } } } } },
+        "responses": {
+          "200": { "description": "Generated snippet", "content": { "application/json": { "schema": { "type": "object", "properties": { "snippet": { "type": "string" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/git/commit": {
+      "post": {
+        "tags": ["Git"],
+        "summary": "Commit the project's current files",
+        "description": "Snapshots every file currently tracked in the project as one commit. No-op (committed: false) if nothing changed since the last commit.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["projectId"],
+            "properties": { "projectId": { "type": "string", "format": "uuid" }, "message": { "type": "string" } }
+          } } }
+        },
+        "responses": {
+          "201": { "description": "New commit created", "content": { "application/json": { "schema": { "type": "object", "properties": { "committed": { "type": "boolean", "example": true }, "oid": { "type": "string" }, "branch": { "type": "string" } } } } } },
+          "200": { "description": "Nothing to commit", "content": { "application/json": { "schema": { "type": "object", "properties": { "committed": { "type": "boolean", "example": false }, "message": { "type": "string" } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/git/log": {
+      "get": {
+        "tags": ["Git"],
+        "summary": "List commits",
+        "description": "Newest first, up to 50 commits.",
+        "parameters": [{ "$ref": "#/components/parameters/ProjectIdQuery" }],
+        "responses": {
+          "200": { "description": "Commit history", "content": { "application/json": { "schema": { "type": "object", "properties": { "branch": { "type": "string" }, "commits": { "type": "array", "items": { "$ref": "#/components/schemas/Commit" } } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/git/diff/{oid}": {
+      "get": {
+        "tags": ["Git"],
+        "summary": "Per-file diff for one commit",
+        "description": "Diffs the commit against its parent (or the empty tree, for the first commit).",
+        "parameters": [
+          { "name": "oid", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{40}$" } },
+          { "$ref": "#/components/parameters/ProjectIdQuery" }
+        ],
+        "responses": {
+          "200": { "description": "Diff", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CommitDiff" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/git/revert": {
+      "post": {
+        "tags": ["Git"],
+        "summary": "Revert the project to a past commit",
+        "description": "Resets every file to its state at `oid` and records the revert itself as a new commit (the history is never rewritten). Returns the reverted files' content so the client can push it into any open editors, including live collaboration documents.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": ["projectId", "oid"],
+            "properties": { "projectId": { "type": "string", "format": "uuid" }, "oid": { "type": "string", "pattern": "^[0-9a-f]{40}$" } }
+          } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Reverted",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "reverted": { "type": "boolean" },
+              "oid": { "type": "string", "description": "The new commit created by the revert" },
+              "files": { "type": "array", "items": { "type": "string" } },
+              "contents": { "type": "object", "additionalProperties": { "type": "string" }, "description": "path -> content at the reverted commit" }
+            } } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    }
+  }
+}
